@@ -1,5 +1,10 @@
 const WEBHOOK_PATH = "/endpoint";
 const MAP_TTL_SECONDS = 60 * 60 * 24 * 30;
+const GUEST_RATE_LIMIT_MS = 3 * 1000;
+const GUEST_RATE_LIMIT_TTL_SECONDS = 8;
+const UNBLOCK_ALL_CONFIRM_KEY = "admin:confirm:unblockall";
+const UNBLOCK_ALL_CONFIRM_TTL_SECONDS = 60;
+const TELEGRAM_MAX_ATTEMPTS = 4; // first attempt + 3 retries
 
 export default {
   async fetch(request, env, ctx) {
@@ -77,6 +82,12 @@ async function onGuestMessage(message, env) {
     return;
   }
 
+  const rateLimited = await isGuestRateLimited(guestId, env);
+  if (rateLimited) {
+    await sendText(guestId, "发送过快，请稍后再试。", env);
+    return;
+  }
+
   const forwardResult = await telegramApi(
     "forwardMessage",
     {
@@ -126,6 +137,9 @@ async function onAdminMessage(message, env) {
   const text = (message.text || "").trim();
   const blockMatch = text.match(/^\/block(?:@\w+)?(?:\s+(-?\d+))?$/);
   const unblockMatch = text.match(/^\/unblock(?:@\w+)?(?:\s+(-?\d+))?$/);
+  const blockListMatch = text.match(/^\/blocklist(?:@\w+)?$/);
+  const unblockAllMatch = text.match(/^\/unblockall(?:@\w+)?$/);
+  const confirmUnblockAllMatch = text.match(/^\/confirm_unblockall(?:@\w+)?$/);
 
   if (text === "/start" || text === "/help") {
     await sendText(
@@ -136,7 +150,8 @@ async function onAdminMessage(message, env) {
         "/block <uid> - 按 UID 屏蔽",
         "/unblock - 解除屏蔽",
         "/unblock <uid> - 按 UID 解除屏蔽",
-        "/unblockall - 解除所有屏蔽",
+        "/unblockall - 发起解除所有屏蔽确认",
+        "/confirm_unblockall - 确认执行解除所有屏蔽",
         "/blocklist - 查看屏蔽列表",
         "直接回复普通消息可回传给用户",
       ].join("\n"),
@@ -145,12 +160,17 @@ async function onAdminMessage(message, env) {
     return;
   }
 
-  if (text === "/blocklist") {
+  if (blockListMatch) {
     await sendBlockList(env);
     return;
   }
 
-  if (text === "/unblockall") {
+  if (unblockAllMatch) {
+    await requestUnblockAllConfirm(env);
+    return;
+  }
+
+  if (confirmUnblockAllMatch) {
     await handleUnblockAll(env);
     return;
   }
@@ -218,6 +238,18 @@ async function handleBlockCommand(message, cmd, commandUid, env) {
 }
 
 async function handleUnblockAll(env) {
+  const pendingConfirm = await env.nfd.get(UNBLOCK_ALL_CONFIRM_KEY);
+  if (pendingConfirm !== "1") {
+    await sendText(
+      env.ENV_ADMIN_UID,
+      "请先发送 /unblockall 发起确认，再在 60 秒内发送 /confirm_unblockall。",
+      env
+    );
+    return;
+  }
+
+  await env.nfd.delete(UNBLOCK_ALL_CONFIRM_KEY);
+
   let cursor;
   let deleted = 0;
 
@@ -236,6 +268,17 @@ async function handleUnblockAll(env) {
   }
 
   await sendText(env.ENV_ADMIN_UID, `已解除所有屏蔽，共 ${deleted} 个用户。`, env);
+}
+
+async function requestUnblockAllConfirm(env) {
+  await env.nfd.put(UNBLOCK_ALL_CONFIRM_KEY, "1", {
+    expirationTtl: UNBLOCK_ALL_CONFIRM_TTL_SECONDS,
+  });
+  await sendText(
+    env.ENV_ADMIN_UID,
+    "确认执行请在 60 秒内发送 /confirm_unblockall 。",
+    env
+  );
 }
 
 async function sendBlockList(env) {
@@ -273,21 +316,51 @@ async function getGuestIdFromReply(replyMessage, env) {
   return env.nfd.get(key);
 }
 
+async function isGuestRateLimited(guestId, env) {
+  const key = `rate:${guestId}`;
+  const now = Date.now();
+  const lastTimestamp = await env.nfd.get(key);
+
+  if (lastTimestamp) {
+    const last = Number(lastTimestamp);
+    if (Number.isFinite(last) && now - last < GUEST_RATE_LIMIT_MS) {
+      return true;
+    }
+  }
+
+  await env.nfd.put(key, String(now), { expirationTtl: GUEST_RATE_LIMIT_TTL_SECONDS });
+  return false;
+}
+
 function telegramApiUrl(methodName, env) {
   return `https://api.telegram.org/bot${env.ENV_BOT_TOKEN}/${methodName}`;
 }
 
 async function telegramApi(methodName, payload, env) {
-  try {
-    const response = await fetch(telegramApiUrl(methodName, env), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return response.json();
-  } catch (_error) {
-    return { ok: false };
+  let lastDescription = "Telegram API request failed";
+
+  for (let attempt = 1; attempt <= TELEGRAM_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(telegramApiUrl(methodName, env), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (response.ok && result && result.ok) {
+        return result;
+      }
+      lastDescription = result?.description || `HTTP ${response.status}`;
+    } catch (error) {
+      lastDescription = error?.message || "Network error";
+    }
+
+    if (attempt < TELEGRAM_MAX_ATTEMPTS) {
+      await sleep(200 * 2 ** (attempt - 1));
+    }
   }
+
+  return { ok: false, description: lastDescription };
 }
 
 async function sendText(chatId, text, env) {
@@ -328,5 +401,11 @@ async function unregisterWebhook(env) {
 
   return new Response(result.ok ? "OK" : JSON.stringify(result, null, 2), {
     status: result.ok ? 200 : 500,
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
