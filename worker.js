@@ -1,7 +1,8 @@
 const WEBHOOK_PATH = "/endpoint";
 const MAP_TTL_SECONDS = 60 * 60 * 24 * 30;
 const GUEST_RATE_LIMIT_MS = 3 * 1000;
-const GUEST_RATE_LIMIT_TTL_SECONDS = 8;
+// Cloudflare KV requires expirationTtl >= 60.
+const GUEST_RATE_LIMIT_TTL_SECONDS = 120;
 const UNBLOCK_ALL_CONFIRM_KEY = "admin:confirm:unblockall";
 const UNBLOCK_ALL_CONFIRM_TTL_SECONDS = 60;
 const TELEGRAM_MAX_ATTEMPTS = 4; // first attempt + 3 retries
