@@ -124,6 +124,8 @@ async function handleFirstContactGate(message, env) {
 
 async function onAdminMessage(message, env) {
   const text = (message.text || "").trim();
+  const blockMatch = text.match(/^\/block(?:@\w+)?(?:\s+(-?\d+))?$/);
+  const unblockMatch = text.match(/^\/unblock(?:@\w+)?(?:\s+(-?\d+))?$/);
 
   if (text === "/start" || text === "/help") {
     await sendText(
@@ -131,7 +133,10 @@ async function onAdminMessage(message, env) {
       [
         "用法：回复一条转发消息后可执行以下命令",
         "/block - 屏蔽该用户",
+        "/block <uid> - 按 UID 屏蔽",
         "/unblock - 解除屏蔽",
+        "/unblock <uid> - 按 UID 解除屏蔽",
+        "/unblockall - 解除所有屏蔽",
         "/blocklist - 查看屏蔽列表",
         "直接回复普通消息可回传给用户",
       ].join("\n"),
@@ -145,8 +150,18 @@ async function onAdminMessage(message, env) {
     return;
   }
 
-  if (text === "/block" || text === "/unblock") {
-    await handleBlockCommand(message, text, env);
+  if (text === "/unblockall") {
+    await handleUnblockAll(env);
+    return;
+  }
+
+  if (blockMatch) {
+    await handleBlockCommand(message, "/block", blockMatch[1], env);
+    return;
+  }
+
+  if (unblockMatch) {
+    await handleBlockCommand(message, "/unblock", unblockMatch[1], env);
     return;
   }
 
@@ -171,15 +186,19 @@ async function onAdminMessage(message, env) {
   );
 }
 
-async function handleBlockCommand(message, cmd, env) {
-  if (!message.reply_to_message) {
-    await sendText(env.ENV_ADMIN_UID, "请先回复一条转发消息，再执行该命令。", env);
-    return;
+async function handleBlockCommand(message, cmd, commandUid, env) {
+  let guestId = commandUid;
+
+  if (!guestId && message.reply_to_message) {
+    guestId = await getGuestIdFromReply(message.reply_to_message, env);
   }
 
-  const guestId = await getGuestIdFromReply(message.reply_to_message, env);
   if (!guestId) {
-    await sendText(env.ENV_ADMIN_UID, "未找到目标用户，请确认回复的是转发消息。", env);
+    await sendText(
+      env.ENV_ADMIN_UID,
+      "未找到目标用户。请回复转发消息，或使用命令 /block <uid>、/unblock <uid>。",
+      env
+    );
     return;
   }
 
@@ -196,6 +215,27 @@ async function handleBlockCommand(message, cmd, env) {
 
   await env.nfd.delete(`block:${guestId}`);
   await sendText(env.ENV_ADMIN_UID, `已解除屏蔽 ${guestId}`, env);
+}
+
+async function handleUnblockAll(env) {
+  let cursor;
+  let deleted = 0;
+
+  do {
+    const page = await env.nfd.list({ prefix: "block:", cursor });
+    for (const key of page.keys) {
+      await env.nfd.delete(key.name);
+      deleted += 1;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  if (deleted === 0) {
+    await sendText(env.ENV_ADMIN_UID, "当前没有屏蔽用户。", env);
+    return;
+  }
+
+  await sendText(env.ENV_ADMIN_UID, `已解除所有屏蔽，共 ${deleted} 个用户。`, env);
 }
 
 async function sendBlockList(env) {

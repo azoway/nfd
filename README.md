@@ -22,6 +22,10 @@
 - 回复转发消息后发送：
   - `/block`：屏蔽该用户
   - `/unblock`：解除该用户屏蔽
+- 也支持直接按 UID 操作（无需回复消息）：
+  - `/block <uid>`：按 UID 屏蔽
+  - `/unblock <uid>`：按 UID 解除屏蔽
+- 直接发送 `/unblockall`：解除所有屏蔽
 - 直接发送 `/blocklist`：查看当前屏蔽列表
 - 发送 `/help` 或 `/start`：查看命令说明
 
@@ -71,7 +75,9 @@ KV 绑定：
 ## 7. 注意事项
 
 - 本项目只处理 Telegram 私聊（`chat.type === "private"`）
-- 管理员指令中的 `/block`、`/unblock` 必须“回复一条转发消息”后执行
+- 管理员指令 `/block`、`/unblock` 支持两种方式：
+  - 回复转发消息执行（自动识别用户）
+  - 直接传入 UID 执行（如 `/block 123456`）
 - `/blocklist` 最多返回前 200 条，避免消息过长
 
 参考 https://github.com/LloydAsp/nfd
