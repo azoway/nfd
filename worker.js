@@ -1,8 +1,7 @@
 const WEBHOOK_PATH = "/endpoint";
-const MAP_TTL_SECONDS = 60 * 60 * 24 * 30;
-const GUEST_RATE_LIMIT_MS = 3 * 1000;
-// Cloudflare KV requires expirationTtl >= 60.
-const GUEST_RATE_LIMIT_TTL_SECONDS = 120;
+const MAP_TTL_SECONDS = 30 * 24 * 60 * 60;
+const RATE_LIMIT_MS = 3 * 1000;
+const RATE_TTL_SECONDS = 120; // Cloudflare KV requires >= 60.
 const UNBLOCK_ALL_CONFIRM_KEY = "admin:confirm:unblockall";
 const UNBLOCK_ALL_CONFIRM_TTL_SECONDS = 60;
 const TELEGRAM_MAX_ATTEMPTS = 4; // first attempt + 3 retries
@@ -10,7 +9,6 @@ const TELEGRAM_MAX_ATTEMPTS = 4; // first attempt + 3 retries
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (url.pathname === WEBHOOK_PATH) {
       return handleWebhook(request, env, ctx);
     }
@@ -23,21 +21,19 @@ export default {
     if (url.pathname === "/health") {
       return new Response("ok");
     }
-
     return new Response("Not Found", { status: 404 });
   },
 };
 
 async function handleWebhook(request, env, ctx) {
-  const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-  if (secret !== env.ENV_BOT_SECRET) {
+  if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.ENV_BOT_SECRET) {
     return new Response("Unauthorized", { status: 403 });
   }
 
   let update;
   try {
     update = await request.json();
-  } catch (_error) {
+  } catch {
     return new Response("Bad Request", { status: 400 });
   }
 
@@ -46,58 +42,36 @@ async function handleWebhook(request, env, ctx) {
 }
 
 async function onUpdate(update, env) {
-  if (!update || !update.message) {
+  const message = update?.message;
+  if (!message?.chat || message.chat.type !== "private") {
     return;
   }
-  await onMessage(update.message, env);
-}
-
-async function onMessage(message, env) {
-  if (!message.chat || message.chat.type !== "private") {
-    return;
-  }
-
-  const adminId = String(env.ENV_ADMIN_UID);
-  const chatId = String(message.chat.id);
-
-  if (chatId === adminId) {
-    await onAdminMessage(message, env);
-    return;
-  }
-
-  await onGuestMessage(message, env);
+  const isAdmin = String(message.chat.id) === String(env.ENV_ADMIN_UID);
+  return isAdmin ? onAdminMessage(message, env) : onGuestMessage(message, env);
 }
 
 async function onGuestMessage(message, env) {
   const guestId = String(message.chat.id);
-  const isBlocked = await env.nfd.get(`block:${guestId}`);
 
-  if (isBlocked === "1") {
-    await sendText(guestId, "你已被禁止联系该机器人。", env);
-    return;
+  if ((await env.nfd.get(`block:${guestId}`)) === "1") {
+    return sendText(guestId, "你已被禁止联系该机器人。", env);
   }
 
-  const isAllowed = await env.nfd.get(`allow:${guestId}`);
-  if (isAllowed !== "1") {
-    await handleFirstContactGate(message, env);
-    return;
+  if ((await env.nfd.get(`allow:${guestId}`)) !== "1") {
+    return handleFirstContactGate(message, env);
   }
 
   let rateLimited = false;
   try {
     rateLimited = await isGuestRateLimited(guestId, env);
   } catch (error) {
-    await notifyAdminDebug(
-      env,
-      `限频检查异常，已放行。uid=${guestId} error=${error?.message || "unknown"}`
-    );
+    await notifyAdminDebug(env, `限频检查异常，已放行。uid=${guestId} error=${error?.message || "unknown"}`);
   }
   if (rateLimited) {
-    await sendText(guestId, "发送过快，请稍后再试。", env);
-    return;
+    return sendText(guestId, "发送过快，请稍后再试。", env);
   }
 
-  const forwardResult = await telegramApi(
+  const result = await telegramApi(
     "forwardMessage",
     {
       chat_id: env.ENV_ADMIN_UID,
@@ -107,17 +81,13 @@ async function onGuestMessage(message, env) {
     env
   );
 
-  if (!forwardResult.ok || !forwardResult.result) {
+  if (!result.ok || !result.result?.message_id) {
     await sendText(guestId, "消息发送失败，请稍后再试。", env);
-    await notifyAdminDebug(
-      env,
-      `消息转发失败。uid=${guestId} reason=${forwardResult.description || "unknown"}`
-    );
+    await notifyAdminDebug(env, `消息转发失败。uid=${guestId} reason=${result.description || "unknown"}`);
     return;
   }
 
-  const adminForwardMessageId = String(forwardResult.result.message_id);
-  await env.nfd.put(`map:${adminForwardMessageId}`, guestId, {
+  await env.nfd.put(`map:${result.result.message_id}`, guestId, {
     expirationTtl: MAP_TTL_SECONDS,
   });
 }
@@ -125,90 +95,80 @@ async function onGuestMessage(message, env) {
 async function handleFirstContactGate(message, env) {
   const guestId = String(message.chat.id);
   const joinCode = String(env.ENV_JOIN_CODE || "").trim();
+  const text = String(message.text || "").trim();
   const verifyCommand = `/verify ${joinCode}`.trim();
-  const text = (message.text || "").trim();
 
   if (!joinCode) {
-    await sendText(guestId, "机器人尚未完成配置，请稍后再试。", env);
-    return;
+    return sendText(guestId, "机器人尚未完成配置，请稍后再试。", env);
   }
 
   if (text === verifyCommand) {
     await env.nfd.put(`allow:${guestId}`, "1");
-    await sendText(guestId, "验证成功，现在可以开始私聊。", env);
-    return;
+    return sendText(guestId, "验证成功，现在可以开始私聊。", env);
   }
 
-  await sendText(
-    guestId,
-    `请先发送验证命令：${verifyCommand}\n通过验证后才能开始私聊。`,
-    env
-  );
+  return sendText(guestId, `请先发送验证命令：${verifyCommand}\n通过验证后才能开始私聊。`, env);
 }
 
 async function onAdminMessage(message, env) {
-  const text = (message.text || "").trim();
-  const blockMatch = text.match(/^\/block(?:@\w+)?(?:\s+(-?\d+))?$/);
-  const unblockMatch = text.match(/^\/unblock(?:@\w+)?(?:\s+(-?\d+))?$/);
-  const blockListMatch = text.match(/^\/blocklist(?:@\w+)?$/);
-  const unblockAllMatch = text.match(/^\/unblockall(?:@\w+)?$/);
-  const confirmUnblockAllMatch = text.match(/^\/confirm_unblockall(?:@\w+)?$/);
+  const text = String(message.text || "").trim();
+  const command = parseCommand(text);
 
-  if (text === "/start" || text === "/help") {
-    await sendText(
-      env.ENV_ADMIN_UID,
-      [
-        "用法：回复一条转发消息后可执行以下命令",
-        "/block - 屏蔽该用户",
-        "/block <uid> - 按 UID 屏蔽",
-        "/unblock - 解除屏蔽",
-        "/unblock <uid> - 按 UID 解除屏蔽",
-        "/unblockall - 发起解除所有屏蔽确认",
-        "/confirm_unblockall - 确认执行解除所有屏蔽",
-        "/blocklist - 查看屏蔽列表",
-        "直接回复普通消息可回传给用户",
-      ].join("\n"),
-      env
-    );
-    return;
+  if (!command) {
+    return replyToGuest(message, env);
   }
 
-  if (blockListMatch) {
-    await sendBlockList(env);
-    return;
+  const { name, arg } = command;
+  if (name === "start" || name === "help") {
+    return sendText(env.ENV_ADMIN_UID, helpText(), env);
+  }
+  if (name === "blocklist") {
+    return sendBlockList(env);
+  }
+  if (name === "unblockall") {
+    return requestUnblockAllConfirm(env);
+  }
+  if (name === "confirm_unblockall") {
+    return confirmAndHandleUnblockAll(env);
+  }
+  if (name === "block" || name === "unblock") {
+    return handleBlockCommand(message, name, arg, env);
   }
 
-  if (unblockAllMatch) {
-    await requestUnblockAllConfirm(env);
-    return;
-  }
+  return replyToGuest(message, env);
+}
 
-  if (confirmUnblockAllMatch) {
-    await handleUnblockAll(env);
-    return;
+function parseCommand(text) {
+  const match = text.match(/^\/([a-z_]+)(?:@\w+)?(?:\s+(.+))?$/i);
+  if (!match) {
+    return null;
   }
+  return { name: match[1].toLowerCase(), arg: (match[2] || "").trim() };
+}
 
-  if (blockMatch) {
-    await handleBlockCommand(message, "/block", blockMatch[1], env);
-    return;
-  }
+function helpText() {
+  return [
+    "用法：回复一条转发消息后可执行以下命令",
+    "/block - 屏蔽该用户",
+    "/block <uid> - 按 UID 屏蔽",
+    "/unblock - 解除屏蔽",
+    "/unblock <uid> - 按 UID 解除屏蔽",
+    "/unblockall - 发起解除所有屏蔽确认",
+    "/confirm_unblockall - 确认执行解除所有屏蔽",
+    "/blocklist - 查看屏蔽列表",
+    "直接回复普通消息可回传给用户",
+  ].join("\n");
+}
 
-  if (unblockMatch) {
-    await handleBlockCommand(message, "/unblock", unblockMatch[1], env);
-    return;
-  }
-
+async function replyToGuest(message, env) {
   if (!message.reply_to_message) {
     return;
   }
-
   const guestId = await getGuestIdFromReply(message.reply_to_message, env);
   if (!guestId) {
-    await sendText(env.ENV_ADMIN_UID, "未找到目标用户，请回复一条转发消息。", env);
-    return;
+    return sendText(env.ENV_ADMIN_UID, "未找到目标用户，请回复一条转发消息。", env);
   }
-
-  await telegramApi(
+  const result = await telegramApi(
     "copyMessage",
     {
       chat_id: guestId,
@@ -217,55 +177,62 @@ async function onAdminMessage(message, env) {
     },
     env
   );
+  if (!result.ok) {
+    await sendText(env.ENV_ADMIN_UID, `回传失败：${result.description || "unknown"}`, env);
+  }
 }
 
-async function handleBlockCommand(message, cmd, commandUid, env) {
-  let guestId = commandUid;
-
-  if (!guestId && message.reply_to_message) {
-    guestId = await getGuestIdFromReply(message.reply_to_message, env);
-  }
-
+async function handleBlockCommand(message, action, arg, env) {
+  const guestId = await resolveTargetUid(message, arg, env);
   if (!guestId) {
-    await sendText(
+    return sendText(
       env.ENV_ADMIN_UID,
       "未找到目标用户。请回复转发消息，或使用命令 /block <uid>、/unblock <uid>。",
       env
     );
-    return;
+  }
+  if (guestId === String(env.ENV_ADMIN_UID)) {
+    return sendText(env.ENV_ADMIN_UID, "不能操作管理员账号。", env);
   }
 
-  if (String(guestId) === String(env.ENV_ADMIN_UID)) {
-    await sendText(env.ENV_ADMIN_UID, "不能操作管理员账号。", env);
-    return;
-  }
-
-  if (cmd === "/block") {
+  if (action === "block") {
     await env.nfd.put(`block:${guestId}`, "1");
-    await sendText(env.ENV_ADMIN_UID, `已屏蔽用户 ${guestId}`, env);
-    return;
+    return sendText(env.ENV_ADMIN_UID, `已屏蔽用户 ${guestId}`, env);
   }
 
   await env.nfd.delete(`block:${guestId}`);
-  await sendText(env.ENV_ADMIN_UID, `已解除屏蔽 ${guestId}`, env);
+  return sendText(env.ENV_ADMIN_UID, `已解除屏蔽 ${guestId}`, env);
 }
 
-async function handleUnblockAll(env) {
-  const pendingConfirm = await env.nfd.get(UNBLOCK_ALL_CONFIRM_KEY);
-  if (pendingConfirm !== "1") {
-    await sendText(
+async function resolveTargetUid(message, arg, env) {
+  if (arg) {
+    return /^-?\d+$/.test(arg) ? arg : null;
+  }
+  if (!message.reply_to_message) {
+    return null;
+  }
+  return getGuestIdFromReply(message.reply_to_message, env);
+}
+
+async function requestUnblockAllConfirm(env) {
+  await env.nfd.put(UNBLOCK_ALL_CONFIRM_KEY, "1", {
+    expirationTtl: UNBLOCK_ALL_CONFIRM_TTL_SECONDS,
+  });
+  return sendText(env.ENV_ADMIN_UID, "确认执行请在 60 秒内发送 /confirm_unblockall 。", env);
+}
+
+async function confirmAndHandleUnblockAll(env) {
+  if ((await env.nfd.get(UNBLOCK_ALL_CONFIRM_KEY)) !== "1") {
+    return sendText(
       env.ENV_ADMIN_UID,
       "请先发送 /unblockall 发起确认，再在 60 秒内发送 /confirm_unblockall。",
       env
     );
-    return;
   }
-
   await env.nfd.delete(UNBLOCK_ALL_CONFIRM_KEY);
 
   let cursor;
   let deleted = 0;
-
   do {
     const page = await env.nfd.list({ prefix: "block:", cursor });
     for (const key of page.keys) {
@@ -275,23 +242,8 @@ async function handleUnblockAll(env) {
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
 
-  if (deleted === 0) {
-    await sendText(env.ENV_ADMIN_UID, "当前没有屏蔽用户。", env);
-    return;
-  }
-
-  await sendText(env.ENV_ADMIN_UID, `已解除所有屏蔽，共 ${deleted} 个用户。`, env);
-}
-
-async function requestUnblockAllConfirm(env) {
-  await env.nfd.put(UNBLOCK_ALL_CONFIRM_KEY, "1", {
-    expirationTtl: UNBLOCK_ALL_CONFIRM_TTL_SECONDS,
-  });
-  await sendText(
-    env.ENV_ADMIN_UID,
-    "确认执行请在 60 秒内发送 /confirm_unblockall 。",
-    env
-  );
+  const text = deleted === 0 ? "当前没有屏蔽用户。" : `已解除所有屏蔽，共 ${deleted} 个用户。`;
+  return sendText(env.ENV_ADMIN_UID, text, env);
 }
 
 async function sendBlockList(env) {
@@ -312,46 +264,31 @@ async function sendBlockList(env) {
   } while (cursor && count < 200);
 
   if (ids.length === 0) {
-    await sendText(env.ENV_ADMIN_UID, "当前没有屏蔽用户。", env);
-    return;
+    return sendText(env.ENV_ADMIN_UID, "当前没有屏蔽用户。", env);
   }
-
-  const body = ids.map((id, index) => `${index + 1}. ${id}`).join("\n");
+  const body = ids.map((id, i) => `${i + 1}. ${id}`).join("\n");
   const suffix = count >= 200 ? "\n(仅显示前 200 条)" : "";
-  await sendText(env.ENV_ADMIN_UID, `屏蔽列表：\n${body}${suffix}`, env);
+  return sendText(env.ENV_ADMIN_UID, `屏蔽列表：\n${body}${suffix}`, env);
 }
 
 async function getGuestIdFromReply(replyMessage, env) {
-  if (!replyMessage || typeof replyMessage.message_id === "undefined") {
+  if (typeof replyMessage?.message_id === "undefined") {
     return null;
   }
-  const key = `map:${replyMessage.message_id}`;
-  return env.nfd.get(key);
+  return env.nfd.get(`map:${replyMessage.message_id}`);
 }
 
 async function isGuestRateLimited(guestId, env) {
   const key = `rate:${guestId}`;
   const now = Date.now();
-  const lastTimestamp = await env.nfd.get(key);
-
-  if (lastTimestamp) {
-    const last = Number(lastTimestamp);
-    const delta = now - last;
-    if (Number.isFinite(last) && delta >= 0 && delta < GUEST_RATE_LIMIT_MS) {
-      return true;
-    }
-  }
-
-  await env.nfd.put(key, String(now), { expirationTtl: GUEST_RATE_LIMIT_TTL_SECONDS });
-  return false;
+  const last = Number(await env.nfd.get(key));
+  const limited = Number.isFinite(last) && now >= last && now - last < RATE_LIMIT_MS;
+  await env.nfd.put(key, String(now), { expirationTtl: RATE_TTL_SECONDS });
+  return limited;
 }
 
 async function notifyAdminDebug(env, text) {
   await sendText(env.ENV_ADMIN_UID, `[debug] ${text}`, env);
-}
-
-function telegramApiUrl(methodName, env) {
-  return `https://api.telegram.org/bot${env.ENV_BOT_TOKEN}/${methodName}`;
 }
 
 async function telegramApi(methodName, payload, env) {
@@ -359,13 +296,13 @@ async function telegramApi(methodName, payload, env) {
 
   for (let attempt = 1; attempt <= TELEGRAM_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(telegramApiUrl(methodName, env), {
+      const response = await fetch(`https://api.telegram.org/bot${env.ENV_BOT_TOKEN}/${methodName}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const result = await response.json();
-      if (response.ok && result && result.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (response.ok && result?.ok) {
         return result;
       }
       lastDescription = result?.description || `HTTP ${response.status}`;
@@ -382,48 +319,27 @@ async function telegramApi(methodName, payload, env) {
 }
 
 async function sendText(chatId, text, env) {
-  await telegramApi(
-    "sendMessage",
-    {
-      chat_id: chatId,
-      text,
-    },
-    env
-  );
+  await telegramApi("sendMessage", { chat_id: chatId, text }, env);
 }
 
 async function registerWebhook(url, env) {
-  const webhookUrl = `${url.protocol}//${url.host}${WEBHOOK_PATH}`;
   const result = await telegramApi(
     "setWebhook",
-    {
-      url: webhookUrl,
-      secret_token: env.ENV_BOT_SECRET,
-    },
+    { url: `${url.origin}${WEBHOOK_PATH}`, secret_token: env.ENV_BOT_SECRET },
     env
   );
-
   return new Response(result.ok ? "OK" : JSON.stringify(result, null, 2), {
     status: result.ok ? 200 : 500,
   });
 }
 
 async function unregisterWebhook(env) {
-  const result = await telegramApi(
-    "setWebhook",
-    {
-      url: "",
-    },
-    env
-  );
-
+  const result = await telegramApi("setWebhook", { url: "" }, env);
   return new Response(result.ok ? "OK" : JSON.stringify(result, null, 2), {
     status: result.ok ? 200 : 500,
   });
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
