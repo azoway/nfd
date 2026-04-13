@@ -83,7 +83,15 @@ async function onGuestMessage(message, env) {
     return;
   }
 
-  const rateLimited = await isGuestRateLimited(guestId, env);
+  let rateLimited = false;
+  try {
+    rateLimited = await isGuestRateLimited(guestId, env);
+  } catch (error) {
+    await notifyAdminDebug(
+      env,
+      `限频检查异常，已放行。uid=${guestId} error=${error?.message || "unknown"}`
+    );
+  }
   if (rateLimited) {
     await sendText(guestId, "发送过快，请稍后再试。", env);
     return;
@@ -101,6 +109,10 @@ async function onGuestMessage(message, env) {
 
   if (!forwardResult.ok || !forwardResult.result) {
     await sendText(guestId, "消息发送失败，请稍后再试。", env);
+    await notifyAdminDebug(
+      env,
+      `消息转发失败。uid=${guestId} reason=${forwardResult.description || "unknown"}`
+    );
     return;
   }
 
@@ -324,13 +336,18 @@ async function isGuestRateLimited(guestId, env) {
 
   if (lastTimestamp) {
     const last = Number(lastTimestamp);
-    if (Number.isFinite(last) && now - last < GUEST_RATE_LIMIT_MS) {
+    const delta = now - last;
+    if (Number.isFinite(last) && delta >= 0 && delta < GUEST_RATE_LIMIT_MS) {
       return true;
     }
   }
 
   await env.nfd.put(key, String(now), { expirationTtl: GUEST_RATE_LIMIT_TTL_SECONDS });
   return false;
+}
+
+async function notifyAdminDebug(env, text) {
+  await sendText(env.ENV_ADMIN_UID, `[debug] ${text}`, env);
 }
 
 function telegramApiUrl(methodName, env) {
